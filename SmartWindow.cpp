@@ -36,7 +36,8 @@ std::string tab_label_for_path(const std::string& path) {
 }
 }
 
-SmartWindow::SmartWindow(int w, int h, const char* title)
+SmartWindow::SmartWindow(int w, int h, const char* title,
+                         const std::string& initial_path)
     : Fl_Window(w, h, title)
 {
     color(fl_rgb_color(255, 255, 255));
@@ -56,6 +57,9 @@ SmartWindow::SmartWindow(int w, int h, const char* title)
     status_bar = new StatusBar(0, h - StatusBar::HEIGHT, w);
     file_view->set_on_navigate([this](const std::string& path) {
         navigate_to(path);
+    });
+    file_view->set_on_open_tab([this](const std::string& path) {
+        open_in_new_tab(path);
     });
     file_view->set_on_counts_changed([this](int sel, int total) {
         status_bar->set_counts(sel, total);
@@ -84,6 +88,12 @@ SmartWindow::SmartWindow(int w, int h, const char* title)
         [this]() { go_forward(); });
 
     tab_states.push_back(TabState{});
+    if (!initial_path.empty()) {
+        tab_states[0].location    = initial_path;
+        tab_states[0].history     = { initial_path };
+        tab_states[0].history_idx = 0;
+        ribbon->location_bar()->value(initial_path.c_str());
+    }
 
     ribbon->set_callbacks(
         [this](int idx) { handle_tab_click(idx); },
@@ -232,6 +242,19 @@ void SmartWindow::handle_plus_click() {
     save_current_state();
     tab_states.push_back(TabState{});
     ribbon->add_tab(tab_label_for_path(tab_states.back().location));
+    int new_idx = ribbon->tab_count() - 1;
+    ribbon->set_active(new_idx);
+    load_tab_state(new_idx);
+}
+
+void SmartWindow::open_in_new_tab(const std::string& path) {
+    save_current_state();
+    TabState st;
+    st.location    = path;
+    st.history     = { path };
+    st.history_idx = 0;
+    tab_states.push_back(std::move(st));
+    ribbon->add_tab(tab_label_for_path(path));
     int new_idx = ribbon->tab_count() - 1;
     ribbon->set_active(new_idx);
     load_tab_state(new_idx);

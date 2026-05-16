@@ -1,25 +1,33 @@
 #include "SidePanel.h"
 
 #include <FL/Fl.H>
+#include <FL/fl_ask.H>
 #include <FL/fl_draw.H>
 #include <FL/Fl_Menu_Item.H>
 
+#include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <set>
+
+#include <sys/wait.h>
 
 namespace fs = std::filesystem;
 
 namespace {
 
-struct MountInfo {
-    std::string device;
-    std::string path;
+struct DriveInfo {
+    std::string device;      // e.g. /dev/sdb2
+    std::string mountpoint;  // empty if not currently mounted
     std::string fstype;
+    std::string label;
+    std::string size;        // human-readable, as reported by lsblk
 };
 
 std::string unescape_mount(const std::string& s) {
@@ -68,27 +76,99 @@ bool is_skippable_path(const std::string& p) {
     return false;
 }
 
-std::vector<MountInfo> enumerate_mounts() {
-    std::vector<MountInfo> result;
-    std::ifstream f("/proc/mounts");
-    if (!f) return result;
+// Parse one line of `lsblk -pPno ...` output, which has the form
+// `KEY1="value1" KEY2="value2" ...`. Values are double-quoted; spaces in
+// values are preserved.
+std::map<std::string, std::string> parse_lsblk_pairs(const std::string& line) {
+    std::map<std::string, std::string> out;
+    size_t i = 0;
+    while (i < line.size()) {
+        while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) i++;
+        if (i >= line.size()) break;
 
-    std::set<std::string> seen;
+        size_t key_start = i;
+        while (i < line.size() && line[i] != '=' && line[i] != ' ') i++;
+        if (i >= line.size() || line[i] != '=') break;
+        std::string key = line.substr(key_start, i - key_start);
+        i++;  // '='
+
+        if (i >= line.size() || line[i] != '"') break;
+        i++;  // opening quote
+        std::string val;
+        while (i < line.size() && line[i] != '"') {
+            if (line[i] == '\\' && i + 1 < line.size()) {
+                val += line[i + 1];
+                i += 2;
+            } else {
+                val += line[i++];
+            }
+        }
+        if (i < line.size()) i++;  // closing quote
+        out[key] = val;
+    }
+    return out;
+}
+
+// Enumerate partitions with a known filesystem (mounted or not). Returns
+// nothing if `lsblk` is unavailable.
+std::vector<DriveInfo> enumerate_drives() {
+    std::vector<DriveInfo> result;
+    FILE* p = popen("lsblk -pPno NAME,TYPE,FSTYPE,SIZE,LABEL,MOUNTPOINT "
+                    "2>/dev/null", "r");
+    if (!p) return result;
+
+    std::set<std::string> seen_devices;
+    char buf[1024];
+    while (std::fgets(buf, sizeof(buf), p)) {
+        std::string line = buf;
+        if (!line.empty() && line.back() == '\n') line.pop_back();
+
+        auto pairs = parse_lsblk_pairs(line);
+        if (pairs["TYPE"] != "part") continue;
+        const std::string& fst = pairs["FSTYPE"];
+        if (!is_user_fs(fst)) continue;
+
+        const std::string& mp = pairs["MOUNTPOINT"];
+        if (mp == "/") continue;                              // shown as Root
+        if (!mp.empty() && is_skippable_path(mp)) continue;   // /boot etc.
+
+        const std::string& dev = pairs["NAME"];
+        if (!seen_devices.insert(dev).second) continue;
+        result.push_back({dev, mp, fst, pairs["LABEL"], pairs["SIZE"]});
+    }
+    pclose(p);
+    return result;
+}
+
+// Look up the mountpoint for a given device in /proc/mounts. Used after a
+// successful `udisksctl mount` to find where the device landed.
+std::string mountpoint_for_device(const std::string& device) {
+    std::ifstream f("/proc/mounts");
     std::string line;
     while (std::getline(f, line)) {
         std::istringstream ss(line);
-        std::string dev, mnt, fst;
-        if (!(ss >> dev >> mnt >> fst)) continue;
-        if (!is_user_fs(fst)) continue;
-
-        std::string path = unescape_mount(mnt);
-        if (path == "/") continue;             // shown explicitly as Root
-        if (is_skippable_path(path)) continue;
-        if (!seen.insert(path).second) continue;
-
-        result.push_back({unescape_mount(dev), path, fst});
+        std::string dev, mnt;
+        if (!(ss >> dev >> mnt)) continue;
+        if (unescape_mount(dev) == device) return unescape_mount(mnt);
     }
-    return result;
+    return "";
+}
+
+bool run_udisksctl_mount(const std::string& device, std::string& message_out) {
+    std::string cmd = "udisksctl mount -b '";
+    for (char c : device) {
+        if (c == '\'') cmd += "'\\''";
+        else           cmd += c;
+    }
+    cmd += "' 2>&1";
+
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) { message_out = "Could not invoke udisksctl."; return false; }
+
+    char buf[512];
+    while (std::fgets(buf, sizeof(buf), p)) message_out += buf;
+    int code = pclose(p);
+    return WIFEXITED(code) && WEXITSTATUS(code) == 0;
 }
 
 std::string home_dir() {
@@ -99,9 +179,45 @@ std::string home_dir() {
 }  // namespace
 
 SidePanel::SidePanel(int x, int y, int w, int h)
-    : Fl_Widget(x, y, w, h)
+    : Fl_Group(x, y, w, h)
 {
+    box(FL_NO_BOX);
+    scrollbar = new Fl_Scrollbar(x + w - SB_W, y, SB_W, h);
+    scrollbar->callback(scrollbar_cb, this);
+    end();
     rebuild_items();
+}
+
+void SidePanel::scrollbar_cb(Fl_Widget* w, void* ud) {
+    auto* self = static_cast<SidePanel*>(ud);
+    self->scroll_y = static_cast<Fl_Scrollbar*>(w)->value();
+    self->redraw();
+}
+
+int SidePanel::content_height() const {
+    int total = TOP_PAD;
+    for (int i = 0; i < (int)items.size(); i++) total += item_height(i);
+    return total + TOP_PAD;
+}
+
+void SidePanel::sync_scrollbar() {
+    int total = content_height();
+    int vis   = h();
+    int max_s = std::max(0, total - vis);
+    if (scroll_y > max_s) scroll_y = max_s;
+    if (scroll_y < 0)     scroll_y = 0;
+    scrollbar->bounds(0, max_s);
+    scrollbar->slider_size(total > 0 ? std::min(1.0, (double)vis / total) : 1.0);
+    scrollbar->linesize(ENTRY_H);
+    scrollbar->value(scroll_y);
+    if (max_s == 0) scrollbar->deactivate();
+    else            scrollbar->activate();
+}
+
+void SidePanel::resize(int X, int Y, int W, int H) {
+    Fl_Group::resize(X, Y, W, H);
+    scrollbar->resize(X + W - SB_W, Y, SB_W, H);
+    sync_scrollbar();
 }
 
 void SidePanel::set_pinned_paths(const std::vector<std::string>& paths) {
@@ -143,10 +259,33 @@ void SidePanel::rebuild_items() {
     push_header("Other Locations");
     push_entry("Root", fl_rgb_color(75, 85, 99), "/");
 
-    for (const auto& m : enumerate_mounts()) {
-        std::string label = fs::path(m.path).filename().string();
-        if (label.empty()) label = m.path;
-        push_entry(label, fl_rgb_color(20, 184, 166), m.path);
+    auto drives = enumerate_drives();
+    // Mounted entries first, then unmounted ones (shown grayed out).
+    std::sort(drives.begin(), drives.end(),
+              [](const DriveInfo& a, const DriveInfo& b) {
+                  if (a.mountpoint.empty() != b.mountpoint.empty())
+                      return !a.mountpoint.empty();
+                  return a.device < b.device;
+              });
+
+    for (const auto& d : drives) {
+        std::string label = d.label;
+        if (label.empty()) {
+            label = d.mountpoint.empty()
+                ? fs::path(d.device).filename().string()
+                : fs::path(d.mountpoint).filename().string();
+        }
+        if (label.empty()) label = d.device;
+        if (!d.size.empty()) label += "  (" + d.size + ")";
+
+        Item it;
+        it.type       = Item::ENTRY;
+        it.label      = label;
+        it.icon_color = fl_rgb_color(20, 184, 166);
+        it.path       = d.mountpoint;
+        it.device     = d.device;
+        it.unmounted  = d.mountpoint.empty();
+        items.push_back(std::move(it));
     }
     push_separator();
 
@@ -175,6 +314,7 @@ void SidePanel::rebuild_items() {
 
     if (selected >= (int)items.size()) selected = -1;
     if (hovered  >= (int)items.size()) hovered  = -1;
+    sync_scrollbar();
     redraw();
 }
 
@@ -188,7 +328,7 @@ int SidePanel::item_height(int i) const {
 }
 
 int SidePanel::item_y(int i) const {
-    int iy = y() + TOP_PAD;
+    int iy = y() + TOP_PAD - scroll_y;
     for (int j = 0; j < i; j++) iy += item_height(j);
     return iy;
 }
@@ -197,6 +337,8 @@ int SidePanel::entry_at(int my) const {
     for (int i = 0; i < (int)items.size(); i++) {
         if (items[i].type != Item::ENTRY) continue;
         int iy = item_y(i);
+        if (iy + ENTRY_H <= y()) continue;       // above viewport
+        if (iy >= y() + h())     break;          // below viewport (and beyond)
         if (my >= iy && my < iy + ENTRY_H) return i;
     }
     return -1;
@@ -211,6 +353,9 @@ void SidePanel::draw() {
     fl_color(fl_rgb_color(249, 250, 251));
     fl_rectf(x(), y(), w(), h());
 
+    int content_w = w() - (scrollbar->active() ? SB_W : 0);
+    fl_push_clip(x(), y(), content_w, h());
+
     for (int i = 0; i < (int)items.size(); i++) {
         const auto& item = items[i];
         int iy = item_y(i);
@@ -220,13 +365,14 @@ void SidePanel::draw() {
                 fl_font(FL_HELVETICA, 11);
                 fl_color(fl_rgb_color(156, 163, 175));
                 fl_draw(item.label.c_str(),
-                        x() + ICON_X, iy, w() - ICON_X * 2, HEADER_H,
+                        x() + ICON_X, iy, content_w - ICON_X * 2, HEADER_H,
                         FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
                 break;
 
             case Item::SEPARATOR:
                 fl_color(fl_rgb_color(229, 231, 235));
-                fl_line(x() + 8, iy + SEP_H / 2, x() + w() - 8, iy + SEP_H / 2);
+                fl_line(x() + 8, iy + SEP_H / 2,
+                        x() + content_w - 8, iy + SEP_H / 2);
                 break;
 
             case Item::ENTRY: {
@@ -235,33 +381,49 @@ void SidePanel::draw() {
 
                 if (sel) {
                     fl_color(fl_rgb_color(224, 231, 255));
-                    fl_rectf(x() + 4, iy + 2, w() - 8, ENTRY_H - 4);
+                    fl_rectf(x() + 4, iy + 2, content_w - 8, ENTRY_H - 4);
                     fl_color(fl_rgb_color(99, 102, 241));
                     fl_rectf(x() + 4, iy + 2, 3, ENTRY_H - 4);
                 } else if (hov) {
                     fl_color(fl_rgb_color(238, 242, 255));
-                    fl_rectf(x() + 4, iy + 2, w() - 8, ENTRY_H - 4);
+                    fl_rectf(x() + 4, iy + 2, content_w - 8, ENTRY_H - 4);
                 }
 
                 int icon_y = iy + (ENTRY_H - ICON_SIZE) / 2;
                 Fl_Color icon_c = item.icon_color;
-                if (item.missing) icon_c = fl_rgb_color(209, 213, 219);
+                if (item.missing) {
+                    icon_c = fl_rgb_color(209, 213, 219);
+                } else if (item.unmounted) {
+                    // Blend toward white so the drive's accent colour is
+                    // still visible, just muted.
+                    uchar r, g, b;
+                    Fl::get_color(icon_c, r, g, b);
+                    icon_c = fl_rgb_color((uchar)((r + 235) / 2),
+                                          (uchar)((g + 235) / 2),
+                                          (uchar)((b + 235) / 2));
+                }
                 fl_color(icon_c);
                 fl_rectf(x() + ICON_X + 6, icon_y, ICON_SIZE, ICON_SIZE);
 
                 fl_font(FL_HELVETICA, 14);
                 Fl_Color tc;
-                if (item.missing) tc = fl_rgb_color(156, 163, 175);
-                else if (sel)     tc = fl_rgb_color(55, 48, 163);
-                else              tc = fl_rgb_color(55, 65, 81);
+                if (item.missing)        tc = fl_rgb_color(156, 163, 175);
+                else if (item.unmounted) tc = fl_rgb_color(140, 150, 165);
+                else if (sel)            tc = fl_rgb_color(55, 48, 163);
+                else                     tc = fl_rgb_color(55, 65, 81);
                 fl_color(tc);
                 fl_draw(item.label.c_str(),
-                        x() + TEXT_X + 4, iy, w() - TEXT_X - 12, ENTRY_H,
+                        x() + TEXT_X + 4, iy,
+                        content_w - TEXT_X - 12, ENTRY_H,
                         FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
                 break;
             }
         }
     }
+
+    fl_pop_clip();
+
+    if (scrollbar->active()) draw_child(*scrollbar);
 
     // Right border
     fl_color(fl_rgb_color(229, 231, 235));
@@ -293,7 +455,39 @@ void SidePanel::show_pinned_menu(int idx, int mx, int my) {
     }
 }
 
+void SidePanel::try_mount_drive(int idx) {
+    if (idx < 0 || idx >= (int)items.size()) return;
+    const Item snapshot = items[idx];  // copy: items get rebuilt below
+    if (!snapshot.unmounted || snapshot.device.empty()) return;
+
+    int choice = fl_choice("Mount %s?\nDevice %s is currently unmounted.",
+                           "Cancel", "Mount", nullptr,
+                           snapshot.label.c_str(), snapshot.device.c_str());
+    if (choice != 1) return;
+
+    std::string message;
+    bool ok = run_udisksctl_mount(snapshot.device, message);
+    if (!ok) {
+        fl_alert("Could not mount %s.\n\n%s",
+                 snapshot.device.c_str(),
+                 message.empty() ? "(no output from udisksctl)" : message.c_str());
+        return;
+    }
+
+    std::string new_mp = mountpoint_for_device(snapshot.device);
+    rebuild_items();
+    if (!new_mp.empty() && on_select_cb) on_select_cb(new_mp);
+}
+
 int SidePanel::handle(int event) {
+    // Forward to the scrollbar when the cursor is over it (or it has been
+    // grabbed for a drag).
+    if (event == FL_PUSH || event == FL_DRAG || event == FL_RELEASE) {
+        if (scrollbar->active() && Fl::event_inside(scrollbar)) {
+            return Fl_Group::handle(event);
+        }
+    }
+
     switch (event) {
         case FL_ENTER:
         case FL_MOVE: {
@@ -305,6 +499,13 @@ int SidePanel::handle(int event) {
         case FL_LEAVE:
             if (hovered != -1) { hovered = -1; redraw(); }
             return 1;
+        case FL_MOUSEWHEEL: {
+            if (!scrollbar->active()) return 1;
+            scroll_y += Fl::event_dy() * ENTRY_H;
+            sync_scrollbar();
+            redraw();
+            return 1;
+        }
         case FL_PUSH: {
             int idx = entry_at(Fl::event_y());
             if (idx < 0) break;
@@ -316,6 +517,10 @@ int SidePanel::handle(int event) {
                 return 1;
             }
 
+            if (items[idx].unmounted) {
+                try_mount_drive(idx);
+                return 1;
+            }
             selected = idx;
             redraw();
             if (on_select_cb && !items[idx].path.empty())
@@ -323,5 +528,5 @@ int SidePanel::handle(int event) {
             return 1;
         }
     }
-    return Fl_Widget::handle(event);
+    return Fl_Group::handle(event);
 }

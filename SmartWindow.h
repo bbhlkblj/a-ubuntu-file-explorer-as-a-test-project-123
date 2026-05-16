@@ -44,6 +44,7 @@ class SmartWindow : public Fl_Window {
     void handle_tab_click(int idx);
     void handle_tab_close(int idx);
     void handle_plus_click();
+    void open_in_new_tab(const std::string& path);
 
     void navigate_to(const std::string& path);
     void go_back();
@@ -54,7 +55,8 @@ class SmartWindow : public Fl_Window {
     static void location_cb(Fl_Widget* w, void* userdata);
 
 public:
-    SmartWindow(int w, int h, const char* title);
+    SmartWindow(int w, int h, const char* title,
+                const std::string& initial_path = {});
 
     void resize(int x, int y, int w, int h) override;
 

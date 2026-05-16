@@ -5,7 +5,17 @@
 #include <FL/Fl.H>
 #include <FL/fl_ask.H>
 #include <FL/fl_draw.H>
+#include <FL/Fl_Button.H>
+#include <FL/Fl_Double_Window.H>
+#include <FL/Fl_Hold_Browser.H>
+#include <FL/Fl_Image.H>
+#include <FL/Fl_Input.H>
+#include <FL/Fl_JPEG_Image.H>
 #include <FL/Fl_Menu_Item.H>
+#include <FL/Fl_PNG_Image.H>
+#include <FL/Fl_Return_Button.H>
+#include <FL/Fl_Scrollbar.H>
+#include <FL/Fl_XPM_Image.H>
 
 #include <algorithm>
 #include <array>
@@ -13,8 +23,11 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <set>
 #include <system_error>
 
 #include <sys/wait.h>
@@ -196,6 +209,602 @@ void open_with_default(const std::string& path) {
     launch_detached("xdg-open", path.c_str(), nullptr);
 }
 
+struct DesktopApp {
+    std::string name;
+    std::string exec;
+    std::string icon;  // Icon= value: either absolute path or theme name
+};
+
+// Locate an installed icon by Icon= value, returning a loadable file path.
+// Absolute paths are returned as-is when they exist. Theme names are resolved
+// against a one-shot cache built from icon-theme roots and /usr/share/pixmaps.
+// We can only load PNG/JPEG/XPM at runtime (FLTK 1.3 has no SVG), so we skip
+// SVG matches.
+const std::map<std::string, std::string>& icon_path_cache() {
+    static std::map<std::string, std::string> cache;
+    static bool built = false;
+    if (built) return cache;
+    built = true;
+
+    auto loadable = [](const fs::path& p) {
+        if (!p.has_extension()) return false;
+        std::string ext = p.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        return ext == ".png" || ext == ".xpm" ||
+               ext == ".jpg" || ext == ".jpeg";
+    };
+
+    // Preferred sizes — larger sources downscale cleaner than upscaling 16px.
+    static const char* size_pref[] = {
+        "48x48", "64x64", "32x32", "128x128", "24x24", "256x256", "16x16"
+    };
+
+    std::vector<std::string> roots;
+    if (const char* home = std::getenv("HOME"))
+        roots.push_back(std::string(home) + "/.local/share/icons");
+    roots.emplace_back("/usr/share/icons");
+    roots.emplace_back("/usr/local/share/icons");
+
+    auto try_record = [&](const std::string& stem, const fs::path& full) {
+        if (cache.find(stem) == cache.end()) cache[stem] = full.string();
+    };
+
+    for (const auto& root : roots) {
+        std::error_code ec;
+        if (!fs::is_directory(root, ec)) continue;
+        for (auto& theme_entry : fs::directory_iterator(root, ec)) {
+            if (ec) break;
+            if (!theme_entry.is_directory(ec)) continue;
+            for (const char* sz : size_pref) {
+                fs::path apps_dir = theme_entry.path() / sz / "apps";
+                if (!fs::is_directory(apps_dir, ec)) continue;
+                for (auto& f : fs::directory_iterator(apps_dir, ec)) {
+                    if (ec) break;
+                    if (!f.is_regular_file(ec)) continue;
+                    if (!loadable(f.path())) continue;
+                    try_record(f.path().stem().string(), f.path());
+                }
+            }
+        }
+    }
+
+    // Pixmaps fallback — flat directory, no size buckets.
+    for (auto pm : {"/usr/share/pixmaps", "/usr/local/share/pixmaps"}) {
+        std::error_code ec;
+        if (!fs::is_directory(pm, ec)) continue;
+        for (auto& f : fs::directory_iterator(pm, ec)) {
+            if (ec) break;
+            if (!f.is_regular_file(ec)) continue;
+            if (!loadable(f.path())) continue;
+            try_record(f.path().stem().string(), f.path());
+        }
+    }
+    return cache;
+}
+
+std::string resolve_icon_path(const std::string& icon_spec) {
+    if (icon_spec.empty()) return "";
+    std::error_code ec;
+    if (!icon_spec.empty() && icon_spec.front() == '/') {
+        return fs::is_regular_file(icon_spec, ec) ? icon_spec : "";
+    }
+    const auto& cache = icon_path_cache();
+    auto it = cache.find(icon_spec);
+    return (it != cache.end()) ? it->second : "";
+}
+
+Fl_Image* load_icon_image(const std::string& path, int size) {
+    if (path.empty()) return nullptr;
+    std::string ext = fs::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+
+    Fl_Image* raw = nullptr;
+    if      (ext == ".png")                       raw = new Fl_PNG_Image(path.c_str());
+    else if (ext == ".jpg" || ext == ".jpeg")     raw = new Fl_JPEG_Image(path.c_str());
+    else if (ext == ".xpm")                       raw = new Fl_XPM_Image(path.c_str());
+    else                                          return nullptr;
+
+    if (!raw || raw->fail() || raw->w() == 0 || raw->h() == 0) {
+        delete raw;
+        return nullptr;
+    }
+    Fl_Image* scaled = raw->copy(size, size);
+    delete raw;
+    return scaled;
+}
+
+// Shell-quote a single argument by wrapping it in single quotes and escaping
+// any embedded single quotes the POSIX way: '...'\''...'.
+std::string sh_quote(const std::string& s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "'\\''";
+        else           out += c;
+    }
+    out += "'";
+    return out;
+}
+
+// True if the Exec line contains a path-bearing field code (%f %F %u %U).
+// Apps without one cannot meaningfully receive a file/folder argument and
+// should not be offered in the "Open With" list.
+bool exec_accepts_path(const std::string& exec) {
+    for (size_t i = 0; i + 1 < exec.size(); i++) {
+        if (exec[i] != '%') continue;
+        char code = exec[i + 1];
+        if (code == 'f' || code == 'F' || code == 'u' || code == 'U') return true;
+        if (code == '%') i++;  // escaped percent: skip both chars
+    }
+    return false;
+}
+
+// Substitute FreeDesktop field codes in a desktop file Exec= line with the
+// chosen path. Strip the deprecated/no-arg codes (%i %c %k %d %D %n %N %v %m).
+std::string apply_field_codes(const std::string& exec, const std::string& path) {
+    std::string quoted = sh_quote(path);
+    std::string out;
+    out.reserve(exec.size() + quoted.size());
+    for (size_t i = 0; i < exec.size(); i++) {
+        if (exec[i] == '%' && i + 1 < exec.size()) {
+            char code = exec[i + 1];
+            i++;
+            switch (code) {
+                case 'f': case 'F': case 'u': case 'U':
+                    out += quoted;
+                    break;
+                case '%':
+                    out += '%';
+                    break;
+                default:
+                    // %i %c %k %d %D %n %N %v %m and any unknown: drop
+                    break;
+            }
+        } else {
+            out += exec[i];
+        }
+    }
+    return out;
+}
+
+void launch_desktop_app(const DesktopApp& app, const std::string& path) {
+    std::string cmd = apply_field_codes(app.exec, path);
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (fork() == 0) {
+            execlp("sh", "sh", "-c", cmd.c_str(), (char*)nullptr);
+            _exit(127);
+        }
+        _exit(0);
+    }
+    if (pid > 0) {
+        int status;
+        waitpid(pid, &status, 0);
+    }
+}
+
+std::vector<DesktopApp> scan_desktop_apps() {
+    // Build the directory list from XDG_DATA_HOME + XDG_DATA_DIRS per spec,
+    // and tack on snap/flatpak roots so apps from those package systems show
+    // up even when distros don't include them in XDG_DATA_DIRS.
+    std::vector<std::string> data_roots;
+    if (const char* xdh = std::getenv("XDG_DATA_HOME"); xdh && *xdh) {
+        data_roots.emplace_back(xdh);
+    } else if (const char* home = std::getenv("HOME")) {
+        data_roots.push_back(std::string(home) + "/.local/share");
+    }
+    if (const char* xdd = std::getenv("XDG_DATA_DIRS"); xdd && *xdd) {
+        std::string s(xdd);
+        size_t start = 0;
+        while (start <= s.size()) {
+            size_t end = s.find(':', start);
+            if (end == std::string::npos) end = s.size();
+            if (end > start) data_roots.emplace_back(s.substr(start, end - start));
+            start = end + 1;
+        }
+    } else {
+        data_roots.emplace_back("/usr/local/share");
+        data_roots.emplace_back("/usr/share");
+    }
+    data_roots.emplace_back("/var/lib/snapd/desktop");
+    data_roots.emplace_back("/var/lib/flatpak/exports/share");
+    if (const char* home = std::getenv("HOME"))
+        data_roots.emplace_back(std::string(home) + "/.local/share/flatpak/exports/share");
+
+    std::vector<std::string> dirs;
+    std::set<std::string> dirs_seen;
+    for (const auto& root : data_roots) {
+        std::string d = root + "/applications";
+        if (dirs_seen.insert(d).second) dirs.push_back(d);
+    }
+
+    std::vector<DesktopApp> result;
+    std::set<std::string> seen;  // dedupe earlier directories shadow later ones
+
+    for (const auto& d : dirs) {
+        std::error_code ec;
+        if (!fs::is_directory(d, ec)) continue;
+        for (auto& entry : fs::directory_iterator(d, ec)) {
+            if (ec) break;
+            if (entry.path().extension() != ".desktop") continue;
+
+            std::string basename = entry.path().filename().string();
+            if (!seen.insert(basename).second) continue;
+
+            std::ifstream f(entry.path());
+            if (!f) continue;
+
+            std::string line, name, exec, type, icon;
+            bool in_entry = false, no_display = false, hidden = false;
+            while (std::getline(f, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.empty() || line[0] == '#') continue;
+                if (line[0] == '[') {
+                    if (in_entry) break;
+                    in_entry = (line == "[Desktop Entry]");
+                    continue;
+                }
+                if (!in_entry) continue;
+                auto eq = line.find('=');
+                if (eq == std::string::npos) continue;
+                std::string key = line.substr(0, eq);
+                std::string val = line.substr(eq + 1);
+                if      (key == "Name")      name = val;
+                else if (key == "Exec")      exec = val;
+                else if (key == "Type")      type = val;
+                else if (key == "Icon")      icon = val;
+                else if (key == "NoDisplay") no_display = (val == "true");
+                else if (key == "Hidden")    hidden     = (val == "true");
+            }
+
+            if (type != "Application")        continue;
+            if (no_display || hidden)         continue;
+            if (name.empty() || exec.empty()) continue;
+            if (!exec_accepts_path(exec))     continue;  // e.g. Steam game launchers
+            result.push_back({name, exec, icon});
+        }
+    }
+
+    std::sort(result.begin(), result.end(),
+              [](const DesktopApp& a, const DesktopApp& b) {
+                  return std::lexicographical_compare(
+                      a.name.begin(), a.name.end(),
+                      b.name.begin(), b.name.end(),
+                      [](char x, char y) {
+                          return std::tolower((unsigned char)x) <
+                                 std::tolower((unsigned char)y);
+                      });
+              });
+    return result;
+}
+
+// A scrollable single-select list of (icon, label) rows. Used by the "Open
+// With" dialog so we can show each application's icon next to its name —
+// Fl_Hold_Browser doesn't natively render per-row images. The widget does
+// NOT own the icons; the caller manages their lifetime.
+class IconListView : public Fl_Group {
+public:
+    struct Row {
+        std::string label;
+        Fl_Image*   icon = nullptr;  // borrowed
+    };
+
+    IconListView(int x, int y, int w, int h)
+        : Fl_Group(x, y, w, h)
+    {
+        box(FL_DOWN_BOX);
+        color(FL_BACKGROUND2_COLOR);
+        sb_ = new Fl_Scrollbar(x + w - SB_W, y, SB_W, h);
+        sb_->callback(scrollbar_cb, this);
+        end();
+    }
+
+    void clear() {
+        rows_.clear();
+        selected_ = -1;
+        scroll_ = 0;
+        sync_scrollbar();
+        redraw();
+    }
+
+    void add_row(const std::string& label, Fl_Image* icon) {
+        rows_.push_back({label, icon});
+        sync_scrollbar();
+        redraw();
+    }
+
+    int value() const { return selected_; }
+    void set_value(int idx) {
+        if (idx < -1 || idx >= (int)rows_.size()) idx = -1;
+        if (selected_ == idx) return;
+        selected_ = idx;
+        if (idx >= 0) ensure_visible(idx);
+        redraw();
+    }
+
+    void set_double_click_cb(std::function<void()> cb) { dbl_cb_ = std::move(cb); }
+    void set_select_cb      (std::function<void()> cb) { sel_cb_ = std::move(cb); }
+
+    void resize(int X, int Y, int W, int H) override {
+        Fl_Group::resize(X, Y, W, H);
+        sb_->resize(X + W - SB_W, Y, SB_W, H);
+        sync_scrollbar();
+    }
+
+    void draw() override {
+        draw_box();
+        int inner_x = x() + Fl::box_dx(box());
+        int inner_y = y() + Fl::box_dy(box());
+        int inner_w = w() - Fl::box_dw(box()) - SB_W;
+        int inner_h = h() - Fl::box_dh(box());
+
+        fl_push_clip(inner_x, inner_y, inner_w, inner_h);
+
+        int first = scroll_ / ROW_H;
+        int last  = std::min((int)rows_.size(),
+                             (scroll_ + inner_h) / ROW_H + 1);
+
+        for (int i = first; i < last; i++) {
+            int ry = inner_y + i * ROW_H - scroll_;
+            bool sel = (i == selected_);
+            Fl_Color bg = sel ? FL_SELECTION_COLOR : color();
+            Fl_Color fg = sel ? fl_contrast(FL_FOREGROUND_COLOR, bg)
+                              : FL_FOREGROUND_COLOR;
+            fl_color(bg);
+            fl_rectf(inner_x, ry, inner_w, ROW_H);
+
+            const Row& r = rows_[i];
+            int icon_x = inner_x + PAD;
+            int icon_y = ry + (ROW_H - ICON_SZ) / 2;
+            if (r.icon) {
+                r.icon->draw(icon_x, icon_y);
+            } else {
+                // Placeholder: simple grey square so layout stays aligned
+                fl_color(fl_rgb_color(210, 210, 210));
+                fl_rectf(icon_x, icon_y, ICON_SZ, ICON_SZ);
+                fl_color(fl_rgb_color(170, 170, 170));
+                fl_rect(icon_x, icon_y, ICON_SZ, ICON_SZ);
+            }
+
+            int text_x = icon_x + ICON_SZ + PAD;
+            int text_w = inner_x + inner_w - text_x - PAD;
+            fl_color(fg);
+            fl_font(FL_HELVETICA, 13);
+            fl_push_clip(text_x, ry, text_w, ROW_H);
+            fl_draw(r.label.c_str(),
+                    text_x, ry, text_w, ROW_H,
+                    (Fl_Align)(FL_ALIGN_LEFT | FL_ALIGN_INSIDE));
+            fl_pop_clip();
+        }
+
+        fl_pop_clip();
+        draw_child(*sb_);
+    }
+
+    int handle(int event) override {
+        switch (event) {
+            case FL_PUSH: {
+                if (Fl::event_inside(sb_)) return Fl_Group::handle(event);
+                take_focus();
+                int idx = row_at(Fl::event_y());
+                if (idx >= 0) {
+                    set_value(idx);
+                    if (sel_cb_) sel_cb_();
+                    if (Fl::event_clicks() > 0 && dbl_cb_) {
+                        Fl::event_clicks(0);
+                        dbl_cb_();
+                    }
+                }
+                return 1;
+            }
+            case FL_MOUSEWHEEL: {
+                if (Fl::event_inside(sb_)) return Fl_Group::handle(event);
+                scroll_ += Fl::event_dy() * ROW_H;
+                clamp_scroll();
+                sb_->value(scroll_);
+                redraw();
+                return 1;
+            }
+            case FL_FOCUS:
+            case FL_UNFOCUS:
+                return 1;
+            case FL_KEYBOARD: {
+                int k = Fl::event_key();
+                if (k == FL_Down)  { move_selection(+1);                 return 1; }
+                if (k == FL_Up)    { move_selection(-1);                 return 1; }
+                if (k == FL_Page_Down) {
+                    move_selection(std::max(1, (h() / ROW_H) - 1));     return 1;
+                }
+                if (k == FL_Page_Up) {
+                    move_selection(-std::max(1, (h() / ROW_H) - 1));    return 1;
+                }
+                if (k == FL_Home)  { if (!rows_.empty()) set_value(0);   return 1; }
+                if (k == FL_End)   { if (!rows_.empty())
+                                         set_value((int)rows_.size()-1); return 1; }
+                if (k == FL_Enter || k == FL_KP_Enter) {
+                    if (selected_ >= 0 && dbl_cb_) dbl_cb_();           return 1;
+                }
+                break;
+            }
+        }
+        return Fl_Group::handle(event);
+    }
+
+private:
+    static constexpr int ROW_H   = 32;
+    static constexpr int ICON_SZ = 24;
+    static constexpr int PAD     = 6;
+    static constexpr int SB_W    = 14;
+
+    std::vector<Row>      rows_;
+    int                   selected_ = -1;
+    int                   scroll_   = 0;
+    Fl_Scrollbar*         sb_;
+    std::function<void()> dbl_cb_;
+    std::function<void()> sel_cb_;
+
+    int content_h() const { return (int)rows_.size() * ROW_H; }
+    int viewport_h() const { return h() - Fl::box_dh(box()); }
+
+    void clamp_scroll() {
+        int max_s = std::max(0, content_h() - viewport_h());
+        if (scroll_ < 0)     scroll_ = 0;
+        if (scroll_ > max_s) scroll_ = max_s;
+    }
+
+    void sync_scrollbar() {
+        int total = content_h();
+        int vis   = viewport_h();
+        clamp_scroll();
+        sb_->bounds(0, std::max(0, total - vis));
+        sb_->slider_size(total > 0 ? std::min(1.0, (double)vis / total) : 1.0);
+        sb_->linesize(ROW_H);
+        sb_->value(scroll_);
+    }
+
+    void ensure_visible(int idx) {
+        int top    = idx * ROW_H;
+        int bottom = top + ROW_H;
+        if (top < scroll_)                       scroll_ = top;
+        else if (bottom > scroll_ + viewport_h()) scroll_ = bottom - viewport_h();
+        clamp_scroll();
+        sb_->value(scroll_);
+    }
+
+    int row_at(int my) const {
+        int inner_y = y() + Fl::box_dy(box());
+        int local   = my - inner_y + scroll_;
+        if (local < 0) return -1;
+        int idx = local / ROW_H;
+        return (idx < 0 || idx >= (int)rows_.size()) ? -1 : idx;
+    }
+
+    void move_selection(int delta) {
+        if (rows_.empty()) return;
+        int n = (int)rows_.size();
+        int cur = (selected_ < 0) ? 0 : selected_ + delta;
+        if (cur < 0)  cur = 0;
+        if (cur >= n) cur = n - 1;
+        set_value(cur);
+        if (sel_cb_) sel_cb_();
+    }
+
+    static void scrollbar_cb(Fl_Widget* w, void* ud) {
+        auto* self = (IconListView*)ud;
+        self->scroll_ = ((Fl_Scrollbar*)w)->value();
+        self->redraw();
+    }
+};
+
+// Runs a modal "Open With" chooser. The cached icons are loaded once and
+// freed when the dialog closes.
+struct OpenWithDialog {
+    Fl_Double_Window*        win    = nullptr;
+    Fl_Input*                filter = nullptr;
+    IconListView*            list   = nullptr;
+    std::vector<DesktopApp>  all;
+    std::vector<Fl_Image*>   icons;     // index-aligned with `all`, owned here
+    std::vector<int>         visible;
+    int                      chosen = -1;
+
+    ~OpenWithDialog() {
+        for (auto* img : icons) delete img;
+    }
+
+    void refresh() {
+        std::string q = filter->value() ? filter->value() : "";
+        std::transform(q.begin(), q.end(), q.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+
+        list->clear();
+        visible.clear();
+        for (size_t i = 0; i < all.size(); i++) {
+            std::string n = all[i].name;
+            std::transform(n.begin(), n.end(), n.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (q.empty() || n.find(q) != std::string::npos) {
+                visible.push_back((int)i);
+                list->add_row(all[i].name, icons[i]);
+            }
+        }
+        if (!visible.empty()) list->set_value(0);
+    }
+
+    void accept() {
+        int sel = list->value();
+        if (sel < 0 || sel >= (int)visible.size()) { cancel(); return; }
+        chosen = visible[sel];
+        win->hide();
+    }
+    void cancel() { chosen = -1; win->hide(); }
+
+    static void filter_cb(Fl_Widget*, void* ud) {
+        ((OpenWithDialog*)ud)->refresh();
+    }
+    static void ok_cb    (Fl_Widget*, void* ud) { ((OpenWithDialog*)ud)->accept(); }
+    static void cancel_cb(Fl_Widget*, void* ud) { ((OpenWithDialog*)ud)->cancel(); }
+};
+
+void show_open_with(const std::string& path) {
+    auto apps = scan_desktop_apps();
+    if (apps.empty()) {
+        fl_alert("No applications found in the desktop entry directories.");
+        return;
+    }
+
+    OpenWithDialog d;
+    d.all = std::move(apps);
+
+    // Load icons up front. Names referenced by multiple apps share a loader
+    // result so we don't decode the same PNG twice.
+    std::map<std::string, Fl_Image*> shared;
+    d.icons.reserve(d.all.size());
+    for (const auto& app : d.all) {
+        std::string p = resolve_icon_path(app.icon);
+        if (p.empty()) { d.icons.push_back(nullptr); continue; }
+        auto it = shared.find(p);
+        if (it != shared.end()) {
+            d.icons.push_back(it->second ? it->second->copy() : nullptr);
+        } else {
+            Fl_Image* img = load_icon_image(p, 24);
+            shared[p] = img;
+            d.icons.push_back(img ? img->copy() : nullptr);
+        }
+    }
+    for (auto& kv : shared) delete kv.second;  // originals freed; copies in d.icons
+
+    const int W = 460, H = 520;
+    d.win = new Fl_Double_Window(W, H, "Open With");
+    d.win->set_modal();
+
+    d.filter = new Fl_Input(12, 14, W - 24, 26);
+    d.filter->textsize(13);
+    d.filter->when(FL_WHEN_CHANGED);
+    d.filter->callback(OpenWithDialog::filter_cb, &d);
+
+    d.list = new IconListView(12, 50, W - 24, H - 100);
+    d.list->set_double_click_cb([&d]() { d.accept(); });
+
+    auto* ok = new Fl_Return_Button(W - 184, H - 40, 80, 28, "Open");
+    ok->callback(OpenWithDialog::ok_cb, &d);
+    auto* cancel = new Fl_Button(W - 94, H - 40, 80, 28, "Cancel");
+    cancel->callback(OpenWithDialog::cancel_cb, &d);
+
+    d.win->end();
+    d.refresh();
+    d.filter->take_focus();
+    d.win->show();
+    while (d.win->shown()) Fl::wait();
+
+    int chosen = d.chosen;
+    DesktopApp app;
+    if (chosen >= 0 && chosen < (int)d.all.size()) app = d.all[chosen];
+    delete d.win;  // also deletes children
+
+    if (chosen >= 0) launch_desktop_app(app, path);
+}
+
 void open_terminal_at(const std::string& dir) {
     pid_t pid = fork();
     if (pid == 0) {
@@ -256,7 +865,7 @@ int FileView::cell_h() const {
 
 int FileView::columns() const {
     if (mode == DETAILS) return 1;
-    int avail = w() - 16;
+    int avail = content_w() - 16;
     int cw    = cell_w();
     return std::max(1, avail / cw);
 }
@@ -311,7 +920,7 @@ void FileView::item_rect(int idx, int& ix, int& iy, int& iw, int& ih) const {
     if (mode == DETAILS) {
         ix = x();
         iy = y() + header_h() + idx * row_h() - scroll_y;
-        iw = w();
+        iw = content_w();
         ih = row_h();
     } else {
         int cols = columns();
@@ -349,19 +958,48 @@ void FileView::clamp_scroll() {
     int max_scroll = std::max(0, content_h() - h());
     if (scroll_y < 0)          scroll_y = 0;
     if (scroll_y > max_scroll) scroll_y = max_scroll;
+    if (scrollbar) sync_scrollbar();
 }
 
 // ---------- Construction ---------------------------------------------------
 
 FileView::FileView(int x, int y, int w, int h)
-    : Fl_Widget(x, y, w, h)
+    : Fl_Group(x, y, w, h)
 {
     box(FL_FLAT_BOX);
+    scrollbar = new Fl_Scrollbar(x + w - SB_W, y, SB_W, h);
+    scrollbar->callback(scrollbar_cb, this);
+    end();
+}
+
+void FileView::scrollbar_cb(Fl_Widget* w, void* ud) {
+    auto* self = static_cast<FileView*>(ud);
+    self->scroll_y = static_cast<Fl_Scrollbar*>(w)->value();
+    self->redraw();
+}
+
+int FileView::content_w() const {
+    return w() - SB_W;
+}
+
+void FileView::sync_scrollbar() {
+    int total = content_h();
+    int vis   = h();
+    int max_s = std::max(0, total - vis);
+    if (scroll_y > max_s) scroll_y = max_s;
+    if (scroll_y < 0)     scroll_y = 0;
+    scrollbar->bounds(0, max_s);
+    scrollbar->slider_size(total > 0 ? std::min(1.0, (double)vis / total) : 1.0);
+    scrollbar->linesize(row_h() ? row_h() : 40);
+    scrollbar->value(scroll_y);
+    if (max_s == 0) scrollbar->deactivate();
+    else            scrollbar->activate();
 }
 
 void FileView::resize(int nx, int ny, int nw, int nh) {
-    Fl_Widget::resize(nx, ny, nw, nh);
-    clamp_scroll();
+    Fl_Group::resize(nx, ny, nw, nh);
+    scrollbar->resize(nx + nw - SB_W, ny, SB_W, nh);
+    sync_scrollbar();
 }
 
 // ---------- Directory loading ----------------------------------------------
@@ -440,6 +1078,7 @@ void FileView::set_location(const std::string& path) {
     }
 
     sort_entries();
+    sync_scrollbar();
     redraw();
     notify_counts();
 }
@@ -642,14 +1281,14 @@ void FileView::draw_details() {
     int type_x = boundary_x(0);
     int date_x = boundary_x(1);
     int size_x = boundary_x(2);
-    int total_right = x() + w() - 6;
+    int total_right = x() + content_w() - 6;
     int size_col_visible = std::max(0, total_right - size_x);
 
     // Header background + bottom border
     fl_color(fl_rgb_color(249, 250, 251));
-    fl_rectf(x(), y(), w(), hh);
+    fl_rectf(x(), y(), content_w(), hh);
     fl_color(fl_rgb_color(229, 231, 235));
-    fl_line(x(), y() + hh - 1, x() + w() - 1, y() + hh - 1);
+    fl_line(x(), y() + hh - 1, x() + content_w() - 1, y() + hh - 1);
 
     draw_header_label("Name",          name_x, col_w_name, sort_col == SORT_NAME, FL_ALIGN_LEFT);
     draw_header_label("Type",          type_x, col_w_type, sort_col == SORT_TYPE, FL_ALIGN_LEFT);
@@ -665,7 +1304,7 @@ void FileView::draw_details() {
     }
 
     // Rows
-    fl_push_clip(x(), y() + hh, w(), h() - hh);
+    fl_push_clip(x(), y() + hh, content_w(), h() - hh);
 
     for (int i = 0; i < (int)entries.size(); i++) {
         int rx, ry, rw, rh;
@@ -725,7 +1364,7 @@ void FileView::draw_details() {
 }
 
 void FileView::draw_grid() {
-    fl_push_clip(x(), y(), w(), h());
+    fl_push_clip(x(), y(), content_w(), h());
 
     const int sz = icon_sz();
     const bool inline_name = (mode == SMALL_ICONS);
@@ -797,12 +1436,15 @@ void FileView::draw() {
         const char* msg = current_path.empty()
             ? "No location"
             : "This folder is empty or cannot be read";
-        fl_draw(msg, x(), y(), w(), h(), FL_ALIGN_CENTER | FL_ALIGN_INSIDE);
-        return;
+        fl_draw(msg, x(), y(), content_w(), h(),
+                FL_ALIGN_CENTER | FL_ALIGN_INSIDE);
+    } else if (mode == DETAILS) {
+        draw_details();
+    } else {
+        draw_grid();
     }
 
-    if (mode == DETAILS) draw_details();
-    else                 draw_grid();
+    draw_child(*scrollbar);
 }
 
 // ---------- Events ----------------------------------------------------------
@@ -1006,15 +1648,21 @@ void FileView::show_entry_menu(int idx, int mx, int my) {
     bool is_dir    = (e.kind == Entry::FOLDER_K || e.kind == Entry::PARENT_K);
     bool is_parent = (e.kind == Entry::PARENT_K);
 
-    enum { A_OPEN = 1, A_OPEN_TERM, A_CUT, A_COPY, A_PASTE_HERE, A_COPY_PATH,
-           A_PIN, A_UNPIN };
+    enum { A_OPEN = 1, A_OPEN_TAB, A_OPEN_WITH, A_OPEN_TERM, A_CUT, A_COPY,
+           A_PASTE_HERE, A_COPY_PATH, A_PIN, A_UNPIN };
 
     bool single   = selection.size() == 1;
     bool pinned   = single && PinStore::instance().contains(e.path);
 
-    Fl_Menu_Item items[12];
+    Fl_Menu_Item items[16];
     int n = 0;
     items[n++] = { "Open", 0, nullptr, (void*)(intptr_t)A_OPEN, 0, 0, 0, 13, 0 };
+    if (is_dir && on_open_tab_cb)
+        items[n++] = { "Open in new tab", 0, nullptr, (void*)(intptr_t)A_OPEN_TAB,
+                       0, 0, 0, 13, 0 };
+    int open_with_flags = is_parent ? FL_MENU_INACTIVE : 0;
+    items[n++] = { "Open with...", 0, nullptr, (void*)(intptr_t)A_OPEN_WITH,
+                   open_with_flags, 0, 0, 13, 0 };
     if (is_dir)
         items[n++] = { "Open in Terminal", 0, nullptr, (void*)(intptr_t)A_OPEN_TERM,
                        FL_MENU_DIVIDER, 0, 0, 13, 0 };
@@ -1046,6 +1694,8 @@ void FileView::show_entry_menu(int idx, int mx, int my) {
     if (!sel) return;
     switch ((int)(intptr_t)sel->user_data()) {
         case A_OPEN:       open_entry(idx); break;
+        case A_OPEN_TAB:   if (on_open_tab_cb) on_open_tab_cb(e.path); break;
+        case A_OPEN_WITH:  show_open_with(e.path); break;
         case A_OPEN_TERM:  open_terminal_at(e.path); break;
         case A_CUT:        clipboard_cut_selected(); break;
         case A_COPY:       clipboard_copy_selected(); break;
@@ -1102,6 +1752,13 @@ void FileView::update_cursor(int mx, int my) {
 }
 
 int FileView::handle(int event) {
+    // Forward to scrollbar when the pointer is over it or it has been grabbed.
+    if (event == FL_PUSH || event == FL_DRAG || event == FL_RELEASE) {
+        if (scrollbar->active() && Fl::event_inside(scrollbar)) {
+            return Fl_Group::handle(event);
+        }
+    }
+
     switch (event) {
         case FL_ENTER:
             return 1;
@@ -1271,5 +1928,5 @@ int FileView::handle(int event) {
             return 1;
         }
     }
-    return Fl_Widget::handle(event);
+    return Fl_Group::handle(event);
 }

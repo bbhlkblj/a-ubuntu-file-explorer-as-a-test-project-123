@@ -1,6 +1,8 @@
 #ifndef FILEVIEW_H
 #define FILEVIEW_H
 
+#include <FL/Fl_Group.H>
+#include <FL/Fl_Scrollbar.H>
 #include <FL/Fl_Widget.H>
 #include <ctime>
 #include <cstdint>
@@ -9,7 +11,7 @@
 #include <string>
 #include <vector>
 
-class FileView : public Fl_Widget {
+class FileView : public Fl_Group {
 public:
     enum ViewMode {
         DETAILS = 0,
@@ -49,6 +51,9 @@ private:
     int                col_w_date = 160;
     int                col_w_size = 100;
 
+    static constexpr int SB_W = 12;
+    Fl_Scrollbar*      scrollbar = nullptr;
+
     int                dragging_boundary = -1;  // 0,1,2 or -1
     int                drag_anchor_x     = 0;
     int                drag_anchor_w     = 0;
@@ -67,6 +72,7 @@ private:
     int                drop_y = 0;
 
     std::function<void(const std::string&)> on_navigate_cb;
+    std::function<void(const std::string&)> on_open_tab_cb;
     std::function<void(int sel, int total)> on_counts_cb;
 
     int  row_h()    const;
@@ -75,9 +81,12 @@ private:
     int  icon_sz()  const;
     int  columns()  const;
     int  content_h() const;
+    int  content_w() const;
     int  item_index_at(int mx, int my) const;
     void item_rect(int idx, int& ix, int& iy, int& iw, int& ih) const;
     void clamp_scroll();
+    void sync_scrollbar();
+    static void scrollbar_cb(Fl_Widget* w, void* ud);
 
     void show_entry_menu(int idx, int mx, int my);
     void show_empty_menu(int mx, int my);
@@ -139,6 +148,9 @@ public:
 
     void set_on_navigate(std::function<void(const std::string&)> cb) {
         on_navigate_cb = std::move(cb);
+    }
+    void set_on_open_tab(std::function<void(const std::string&)> cb) {
+        on_open_tab_cb = std::move(cb);
     }
     void set_on_counts_changed(std::function<void(int, int)> cb) {
         on_counts_cb = std::move(cb);
